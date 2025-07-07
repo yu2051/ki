@@ -62,22 +62,27 @@ const allDb = (sql, params = []) => {
     });
 };
 
+// Simple queue for serializing database operations
+let dbOperationQueue = Promise.resolve();
+
 /**
  * Executes a series of database operations sequentially.
- * @param {Function} callback A function that takes the db instance and performs operations.
- * @returns {Promise<void>}
+ * @param {Function} callback A function that performs async operations.
+ * @returns {Promise<any>} Returns the result of the callback function.
  */
 const serializeDb = (callback) => {
-    return new Promise((resolve, reject) => {
-        db.serialize(() => {
-            try {
-                callback();
-                resolve();
-            } catch (err) {
-                reject(err);
-            }
-        });
+    // Chain the operation to the queue
+    dbOperationQueue = dbOperationQueue.then(async () => {
+        try {
+            return await callback();
+        } catch (error) {
+            // Log error but don't break the queue
+            console.error('Error in serialized database operation:', error);
+            throw error;
+        }
     });
+
+    return dbOperationQueue;
 };
 
 // --- Settings Management (Generic Key-Value) ---

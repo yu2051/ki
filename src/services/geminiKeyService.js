@@ -29,18 +29,19 @@ async function addGeminiKey(apiKey, name) {
         VALUES (?, ?, ?, '', '{}', '{}', NULL, '{}', CURRENT_TIMESTAMP)
     `;
 
-    try {
-        // Insert the key first
-        await configService.runDb(insertSQL, [keyId, trimmedApiKey, keyName]);
-
-        // Use transaction for updating the key list
+    // Use serializeDb to ensure atomic operations and avoid concurrency issues
+    return await configService.serializeDb(async () => {
+        // Start a single transaction for the entire operation
         await configService.runDb('BEGIN TRANSACTION');
-        
+
         try {
-            // Get the current list directly with SQL to avoid nested transactions
+            // Insert the key first
+            await configService.runDb(insertSQL, [keyId, trimmedApiKey, keyName]);
+
+            // Get the current list directly with SQL
             const currentListValue = await configService.getDb('SELECT value FROM settings WHERE key = ?', ['gemini_key_list']);
             let currentList = [];
-            
+
             try {
                 currentList = currentListValue ? JSON.parse(currentListValue.value) : [];
                 if (!Array.isArray(currentList)) {
@@ -51,36 +52,167 @@ async function addGeminiKey(apiKey, name) {
                 console.warn("Error parsing gemini_key_list, resetting:", e);
                 currentList = [];
             }
-            
+
             // Add the new key ID to the list
             currentList.push(keyId);
-            
+
             // Update the list directly with SQL
-            await configService.runDb('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', 
+            await configService.runDb('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)',
                 ['gemini_key_list', JSON.stringify(currentList)]);
-            
+
             // Commit the transaction
             await configService.runDb('COMMIT');
-            
+
             console.log(`Added key ${keyId} to database and rotation list.`);
-            
-            // Sync updates to GitHub outside transaction
-            await syncToGitHub();
-            
+
             return { id: keyId, name: keyName };
         } catch (error) {
             // Rollback transaction on error
             await configService.runDb('ROLLBACK');
-            console.error(`Transaction error while updating gemini_key_list:`, error);
+            console.error(`Transaction error while adding gemini key:`, error);
             throw error;
         }
-    } catch (err) {
+    }).then(result => {
+        // Sync updates to GitHub outside of serialized operation
+        syncToGitHub().catch(err => {
+            console.warn(`Failed to sync to GitHub after adding key ${keyId}:`, err);
+        });
+        return result;
+    }).catch(err => {
         if (err.message.includes('UNIQUE constraint failed: gemini_keys.api_key')) {
             throw new Error('Cannot add duplicate API key.');
         }
         console.error(`Error adding Gemini key:`, err);
         throw new Error(`Failed to add Gemini key: ${err.message}`);
+    });
+}
+
+/**
+ * Adds multiple Gemini API keys in a single transaction for better performance.
+ * @param {Array<string>} apiKeys Array of API keys to add.
+ * @returns {Promise<{successCount: number, failureCount: number, results: Array<{key: string, success: boolean, id?: string, name?: string, error?: string}>}>}
+ */
+async function addMultipleGeminiKeys(apiKeys) {
+    if (!Array.isArray(apiKeys) || apiKeys.length === 0) {
+        throw new Error('Invalid API keys array provided.');
     }
+
+    const results = [];
+    let successCount = 0;
+    let failureCount = 0;
+
+    // Use serializeDb to ensure atomic operations
+    return await configService.serializeDb(async () => {
+        await configService.runDb('BEGIN TRANSACTION');
+
+        try {
+            // Get the current list
+            const currentListValue = await configService.getDb('SELECT value FROM settings WHERE key = ?', ['gemini_key_list']);
+            let currentList = [];
+
+            try {
+                currentList = currentListValue ? JSON.parse(currentListValue.value) : [];
+                if (!Array.isArray(currentList)) {
+                    console.warn("Setting 'gemini_key_list' is not an array, resetting.");
+                    currentList = [];
+                }
+            } catch (e) {
+                console.warn("Error parsing gemini_key_list, resetting:", e);
+                currentList = [];
+            }
+
+            const newKeyIds = [];
+
+            // Process each key
+            for (const apiKey of apiKeys) {
+                try {
+                    if (!apiKey || typeof apiKey !== 'string' || apiKey.trim() === '') {
+                        results.push({
+                            key: apiKey,
+                            success: false,
+                            error: 'Invalid API key provided.'
+                        });
+                        failureCount++;
+                        continue;
+                    }
+
+                    const trimmedApiKey = apiKey.trim();
+
+                    // Generate a unique ID
+                    const timestamp = Date.now();
+                    const randomString = crypto.randomBytes(4).toString('hex');
+                    const keyId = `gk-${timestamp}-${randomString}`;
+                    const keyName = keyId;
+
+                    const insertSQL = `
+                        INSERT INTO gemini_keys
+                        (id, api_key, name, usage_date, model_usage, category_usage, error_status, consecutive_429_counts, created_at)
+                        VALUES (?, ?, ?, '', '{}', '{}', NULL, '{}', CURRENT_TIMESTAMP)
+                    `;
+
+                    // Insert the key
+                    await configService.runDb(insertSQL, [keyId, trimmedApiKey, keyName]);
+
+                    // Add to the list
+                    newKeyIds.push(keyId);
+
+                    results.push({
+                        key: trimmedApiKey,
+                        success: true,
+                        id: keyId,
+                        name: keyName
+                    });
+                    successCount++;
+
+                    console.log(`Added key ${keyId} to batch.`);
+
+                } catch (keyError) {
+                    if (keyError.message.includes('UNIQUE constraint failed: gemini_keys.api_key')) {
+                        results.push({
+                            key: apiKey,
+                            success: false,
+                            error: 'Duplicate API key.'
+                        });
+                    } else {
+                        results.push({
+                            key: apiKey,
+                            success: false,
+                            error: keyError.message
+                        });
+                    }
+                    failureCount++;
+                    console.error(`Error adding key ${apiKey}:`, keyError);
+                }
+            }
+
+            // Update the key list with all new keys at once
+            if (newKeyIds.length > 0) {
+                currentList.push(...newKeyIds);
+                await configService.runDb('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)',
+                    ['gemini_key_list', JSON.stringify(currentList)]);
+            }
+
+            // Commit the transaction
+            await configService.runDb('COMMIT');
+
+            console.log(`Batch add completed: ${successCount} successful, ${failureCount} failed.`);
+
+            return { successCount, failureCount, results };
+        } catch (error) {
+            // Rollback transaction on error
+            await configService.runDb('ROLLBACK');
+            console.error(`Transaction error during batch add:`, error);
+            throw error;
+        }
+    }).then(result => {
+        // Sync updates to GitHub outside of serialized operation
+        if (result.successCount > 0) {
+            syncToGitHub().catch(err => {
+                console.warn(`Failed to sync to GitHub after batch add:`, err);
+            });
+        }
+        return result;
+    });
 }
 
 /**
@@ -274,25 +406,24 @@ async function getErrorKeys() {
  * @returns {Promise<void>}
  */
 async function clearKeyError(keyId) {
-    await configService.runDb('BEGIN TRANSACTION');
+    await configService.serializeDb(async () => {
+        try {
+            const result = await configService.runDb('UPDATE gemini_keys SET error_status = NULL WHERE id = ?', [keyId]);
+            if (result.changes === 0) {
+                throw new Error(`Key with ID '${keyId}' not found for clearing error status.`);
+            }
 
-    try {
-        const result = await configService.runDb('UPDATE gemini_keys SET error_status = NULL WHERE id = ?', [keyId]);
-        if (result.changes === 0) {
-            await configService.runDb('ROLLBACK');
-            throw new Error(`Key with ID '${keyId}' not found for clearing error status.`);
+            console.log(`Cleared error status for key ${keyId}.`);
+        } catch (error) {
+            console.error(`Error clearing error status for key ${keyId}:`, error);
+            throw error;
         }
+    });
 
-        await configService.runDb('COMMIT');
-        console.log(`Cleared error status for key ${keyId}.`);
-
-        // Sync updates to GitHub - outside transaction
-        await syncToGitHub();
-    } catch (error) {
-        await configService.runDb('ROLLBACK');
-        console.error(`Error clearing error status for key ${keyId}:`, error);
-        throw error;
-    }
+    // Sync updates to GitHub (async, outside of serialized operation)
+    syncToGitHub().catch(err => {
+        console.warn(`Failed to sync to GitHub after clearing error for key ${keyId}:`, err);
+    });
 }
 
 /**
@@ -300,76 +431,76 @@ async function clearKeyError(keyId) {
  * @returns {Promise<{deletedCount: number, deletedKeys: Array<{id: string, name: string}>}>}
  */
 async function deleteAllErrorKeys() {
-    await configService.serializeDb(async () => {
+    return await configService.serializeDb(async () => {
         await configService.runDb('BEGIN TRANSACTION');
 
-    try {
-        // First, get all error keys to return information about what was deleted
-        const errorKeys = await configService.allDb('SELECT id, name FROM gemini_keys WHERE error_status = 400 OR error_status = 401 OR error_status = 403');
-
-        if (errorKeys.length === 0) {
-            await configService.runDb('COMMIT');
-            return { deletedCount: 0, deletedKeys: [] };
-        }
-
-        // Get the error key IDs
-        const errorKeyIds = errorKeys.map(key => key.id);
-
-        // Delete all error keys from the database
-        const placeholders = errorKeyIds.map(() => '?').join(',');
-        const deleteResult = await configService.runDb(
-            `DELETE FROM gemini_keys WHERE id IN (${placeholders})`,
-            errorKeyIds
-        );
-
-        // Update the rotation list - remove all deleted keys
-        const currentListValue = await configService.getDb('SELECT value FROM settings WHERE key = ?', ['gemini_key_list']);
-        let currentList = [];
         try {
-            currentList = currentListValue ? JSON.parse(currentListValue.value) : [];
-            if (Array.isArray(currentList)) {
-                // Filter out deleted keys
-                const updatedList = currentList.filter(keyId => !errorKeyIds.includes(keyId));
+            // First, get all error keys to return information about what was deleted
+            const errorKeys = await configService.allDb('SELECT id, name FROM gemini_keys WHERE error_status = 400 OR error_status = 401 OR error_status = 403');
 
-                if (updatedList.length !== currentList.length) {
-                    await configService.runDb('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)',
-                        ['gemini_key_list', JSON.stringify(updatedList)]);
+            if (errorKeys.length === 0) {
+                await configService.runDb('COMMIT');
+                return { deletedCount: 0, deletedKeys: [] };
+            }
 
-                    // Reset index if necessary
-                    const currentIndexValue = await configService.getDb('SELECT value FROM settings WHERE key = ?', ['gemini_key_index']);
-                    let currentIndex = currentIndexValue ? parseInt(currentIndexValue.value, 10) : 0;
+            // Get the error key IDs
+            const errorKeyIds = errorKeys.map(key => key.id);
 
-                    if (updatedList.length === 0) {
-                        await configService.runDb('DELETE FROM settings WHERE key = ?', ['gemini_key_index']);
-                    } else if (currentIndex >= updatedList.length) {
+            // Delete all error keys from the database
+            const placeholders = errorKeyIds.map(() => '?').join(',');
+            const deleteResult = await configService.runDb(
+                `DELETE FROM gemini_keys WHERE id IN (${placeholders})`,
+                errorKeyIds
+            );
+
+            // Update the rotation list - remove all deleted keys
+            const currentListValue = await configService.getDb('SELECT value FROM settings WHERE key = ?', ['gemini_key_list']);
+            let currentList = [];
+            try {
+                currentList = currentListValue ? JSON.parse(currentListValue.value) : [];
+                if (Array.isArray(currentList)) {
+                    // Filter out deleted keys
+                    const updatedList = currentList.filter(keyId => !errorKeyIds.includes(keyId));
+
+                    if (updatedList.length !== currentList.length) {
                         await configService.runDb('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)',
-                            ['gemini_key_index', '0']);
+                            ['gemini_key_list', JSON.stringify(updatedList)]);
+
+                        // Reset index if necessary
+                        const currentIndexValue = await configService.getDb('SELECT value FROM settings WHERE key = ?', ['gemini_key_index']);
+                        let currentIndex = currentIndexValue ? parseInt(currentIndexValue.value, 10) : 0;
+
+                        if (updatedList.length === 0) {
+                            await configService.runDb('DELETE FROM settings WHERE key = ?', ['gemini_key_index']);
+                        } else if (currentIndex >= updatedList.length) {
+                            await configService.runDb('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)',
+                                ['gemini_key_index', '0']);
+                        }
                     }
                 }
+            } catch (listError) {
+                console.warn('Error updating rotation list during bulk delete:', listError);
+                // Continue with the transaction, as the main deletion was successful
             }
-        } catch (listError) {
-            console.warn('Error updating rotation list during bulk delete:', listError);
-            // Continue with the transaction, as the main deletion was successful
+
+            await configService.runDb('COMMIT');
+            console.log(`Deleted ${deleteResult.changes} error keys from database.`);
+
+            // Sync updates to GitHub - outside transaction
+            await syncToGitHub();
+
+            return {
+                deletedCount: deleteResult.changes,
+                deletedKeys: errorKeys.map(key => ({
+                    id: key.id,
+                    name: key.name || key.id
+                }))
+            };
+        } catch (error) {
+            await configService.runDb('ROLLBACK');
+            console.error('Error deleting all error keys:', error);
+            throw error;
         }
-
-        await configService.runDb('COMMIT');
-        console.log(`Deleted ${deleteResult.changes} error keys from database.`);
-
-        // Sync updates to GitHub - outside transaction
-        await syncToGitHub();
-
-        return {
-            deletedCount: deleteResult.changes,
-            deletedKeys: errorKeys.map(key => ({
-                id: key.id,
-                name: key.name || key.id
-            }))
-        };
-    } catch (error) {
-        await configService.runDb('ROLLBACK');
-        console.error('Error deleting all error keys:', error);
-        throw error;
-    }
     });
 }
 
@@ -384,34 +515,30 @@ async function recordKeyError(keyId, status) {
         console.warn(`Attempted to record invalid error status ${status} for key ${keyId}.`);
         return;
     }
-    
-    // Use transaction to ensure atomicity
-    await configService.runDb('BEGIN TRANSACTION');
-    
-    try {
-        const result = await configService.runDb(
-            'UPDATE gemini_keys SET error_status = ? WHERE id = ?',
-            [status, keyId]
-        );
-        
-        if (result.changes > 0) {
-            // Commit the transaction
-            await configService.runDb('COMMIT');
-            console.log(`Recorded error status ${status} for key ${keyId}.`);
-            
-            // Sync updates to GitHub (outside transaction)
-            await syncToGitHub();
-        } else {
-            // Commit anyway since no update was made (key not found)
-            await configService.runDb('COMMIT');
-            console.warn(`Cannot record error: Key info not found for ID: ${keyId}`);
+
+    // Use serializeDb to avoid transaction conflicts during batch operations
+    await configService.serializeDb(async () => {
+        try {
+            const result = await configService.runDb(
+                'UPDATE gemini_keys SET error_status = ? WHERE id = ?',
+                [status, keyId]
+            );
+
+            if (result.changes > 0) {
+                console.log(`Recorded error status ${status} for key ${keyId}.`);
+            } else {
+                console.warn(`Cannot record error: Key info not found for ID: ${keyId}`);
+            }
+        } catch (e) {
+            console.error(`Failed to record error status ${status} for key ${keyId}:`, e);
+            // Don't rethrow, recording error is secondary
         }
-    } catch (e) {
-        // Rollback on error
-        await configService.runDb('ROLLBACK');
-        console.error(`Failed to record error status ${status} for key ${keyId}:`, e);
-        // Don't rethrow, recording error is secondary
-    }
+    });
+
+    // Sync updates to GitHub (async, don't wait, outside of serialized operation)
+    syncToGitHub().catch(err => {
+        console.warn(`Failed to sync to GitHub after recording error for key ${keyId}:`, err);
+    });
 }
 
 // --- Key Selection and Usage Update Logic ---
@@ -622,14 +749,10 @@ async function getNextAvailableGeminiKey(requestedModelId, updateIndex = true) {
  */
 async function incrementKeyUsage(keyId, modelId, category) {
     await configService.serializeDb(async () => {
-        // Start a transaction for atomic update
-        await configService.runDb('BEGIN TRANSACTION');
-        
         try {
-            // Get the most current key data within the transaction
+            // Get the most current key data
             const keyRow = await configService.getDb('SELECT usage_date, model_usage, category_usage, consecutive_429_counts FROM gemini_keys WHERE id = ?', [keyId]);
             if (!keyRow) {
-                await configService.runDb('ROLLBACK');
                 console.warn(`Cannot increment usage: Key info not found for ID: ${keyId}`);
                 return;
             }
@@ -661,7 +784,7 @@ async function incrementKeyUsage(keyId, modelId, category) {
                 categoryUsage.flash = (categoryUsage.flash || 0) + 1;
             }
 
-            // Update the database within the transaction
+            // Update the database (serializeDb provides atomicity)
             const sql = `
                 UPDATE gemini_keys
                 SET usage_date = ?, model_usage = ?, category_usage = ?, consecutive_429_counts = ?
@@ -674,20 +797,18 @@ async function incrementKeyUsage(keyId, modelId, category) {
                 JSON.stringify(consecutive429Counts), // Store empty object (reset counters)
                 keyId
             ]);
-            
-            // Commit the transaction after successful update
-            await configService.runDb('COMMIT');
-            
+
             console.log(`Usage for key ${keyId} updated. Date: ${usageDate}, Model: ${modelId} (${category}), Models: ${JSON.stringify(modelUsage)}, Categories: ${JSON.stringify(categoryUsage)}, 429Counts reset.`);
-            
-            // Sync updates to GitHub - outside transaction
-            await syncToGitHub();
+
         } catch (e) {
-            // Rollback the transaction if any error occurs
-            await configService.runDb('ROLLBACK');
             console.error(`Failed to increment usage for key ${keyId}:`, e);
             // Don't rethrow, allow request to potentially succeed anyway
         }
+    });
+
+    // Sync updates to GitHub (async, outside of serialized operation)
+    syncToGitHub().catch(err => {
+        console.warn(`Failed to sync to GitHub after incrementing usage for key ${keyId}:`, err);
     });
 }
 
@@ -951,6 +1072,7 @@ async function handle429Error(keyId, category, modelId, errorDetails) {
 
 module.exports = {
     addGeminiKey,
+    addMultipleGeminiKeys,
     deleteGeminiKey,
     getAllGeminiKeysWithUsage,
     getNextAvailableGeminiKey,

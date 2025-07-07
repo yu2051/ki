@@ -46,6 +46,30 @@ router.route('/gemini-keys')
         }
     });
 
+// --- Batch Add Gemini Keys --- (/api/admin/gemini-keys/batch)
+router.post('/gemini-keys/batch', async (req, res, next) => {
+    try {
+        const { keys } = parseBody(req);
+        if (!Array.isArray(keys) || keys.length === 0) {
+            return res.status(400).json({ error: 'Request body must include a valid array of API keys' });
+        }
+
+        // Validate that all items are strings
+        const invalidKeys = keys.filter(key => !key || typeof key !== 'string');
+        if (invalidKeys.length > 0) {
+            return res.status(400).json({ error: 'All API keys must be valid strings' });
+        }
+
+        const result = await geminiKeyService.addMultipleGeminiKeys(keys);
+        res.status(201).json({
+            success: true,
+            ...result
+        });
+    } catch (error) {
+        next(error);
+    }
+});
+
 router.delete('/gemini-keys/:id', async (req, res, next) => {
     try {
         const keyId = req.params.id;
